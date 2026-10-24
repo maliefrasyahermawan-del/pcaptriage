@@ -1,0 +1,52 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "pcaptriage"
+version = "0.1.0"
+description = "Offline CLI tool for fast forensic triage of PCAP/PCAPNG files."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "MBC Telkom University Lab" }]
+keywords = ["pcap", "forensics", "network", "triage", "ctf", "soc", "ir"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Environment :: Console",
+    "Intended Audience :: Information Technology",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Topic :: Security",
+    "Topic :: System :: Networking :: Monitoring",
+]
+dependencies = [
+    "scapy>=2.5",
+    "dpkt>=1.9",
+    "click>=8.1",
+    "jinja2>=3.1",
+    "rich>=13.0",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=7.4", "pytest-cov>=4.1"]
+magic = ["python-magic>=0.4"]
+
+[project.scripts]
+pcaptriage = "pcaptriage.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/mbc-telkom/pcaptriage"
+Issues = "https://github.com/mbc-telkom/pcaptriage/issues"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["pcaptriage*"]
+
+[tool.setuptools.package-data]
+pcaptriage = ["templates/*.j2"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]

@@ -1,0 +1,872 @@
+================================================================================
+           PANDUAN LENGKAP PENGGUNAAN PCAPTriage v0.1.0
+         CLI Tool Offline untuk Forensik Jaringan & Triage PCAP
+               MBC Telkom University — Network Security Lab
+================================================================================
+
+DAFTAR ISI
+----------
+  1. Apa itu PCAPTriage?
+  2. Fungsi & Kegunaan
+  3. Arsitektur dan Cara Kerja Internal
+  4. Instalasi Step-by-Step
+  5. Struktur Folder
+  6. Panduan Perintah (Command Reference)
+  7. Contoh Skenario Penggunaan
+  8. Format Output & Laporan
+  9. Memahami Evidence & Severity
+ 10. Tips untuk CTF
+ 11. Tips untuk SOC / Incident Response
+ 12. Troubleshooting
+ 13. Cara Menjalankan Unit Test
+
+
+================================================================================
+1. APA ITU PCAPTriage?
+================================================================================
+
+PCAPTriage adalah command-line tool (CLI) yang berjalan OFFLINE untuk melakukan
+"triage" cepat terhadap file PCAP atau PCAPNG hasil capture lalu lintas jaringan.
+
+Triage = proses cepat untuk menentukan "ada apa di capture ini?" sebelum
+melakukan analisis mendalam di Wireshark atau tool lainnya.
+
+MASALAH YANG DISELESAIKAN:
+  - Analisis PCAP manual di Wireshark membutuhkan waktu lama dan banyak klik
+  - Analis perlu jawaban cepat: ada flag CTF? ada credential bocor? ada malware?
+  - Tidak ada tool yang langsung menghasilkan laporan forensik siap kirim
+  - Dokumentasi chain-of-custody (siapa-menemukan-apa-kapan) sulit dilakukan manual
+
+SOLUSI PCAPTriage:
+  - Jalankan 1 perintah, dapatkan laporan lengkap dalam hitungan detik
+  - Setiap temuan (finding) otomatis dicatat dengan hash SHA-256, timestamp,
+    nomor paket, IP sumber dan tujuan
+  - Output langsung bisa dibuka di browser (HTML) atau dimasukkan ke SIEM (JSON)
+  - Built-in pola pencarian untuk CTF flags, JWT token, AWS keys, password, dll
+
+
+================================================================================
+2. FUNGSI & KEGUNAAN
+================================================================================
+
+PCAPTriage memiliki 6 fungsi utama yang berjalan otomatis:
+
+---------------------------------------------------------------------
+FUNGSI 1: AUTO-SUMMARY (Ringkasan Capture)
+---------------------------------------------------------------------
+  Analyzer : SummaryAnalyzer + TalkersAnalyzer
+  Apa yang dilakukan:
+    - Menghitung total paket, total bytes, durasi capture
+    - Memecah protokol: berapa paket TCP, UDP, ICMP, DNS, HTTP, TLS, SSH
+    - Menemukan top 10 IP pengirim (sumber terbanyak kirim paket)
+    - Menemukan top 10 IP penerima (tujuan terbanyak menerima paket)
+    - Menemukan top 10 port yang digunakan
+  Kegunaan:
+    - Langkah pertama dalam setiap investigasi
+    - Cepat tahu siapa "top talker" di jaringan
+    - Deteksi anomali: IP asing tiba-tiba kirim banyak paket
+
+---------------------------------------------------------------------
+FUNGSI 2: EVIDENCE RECORD (Pencatatan Bukti)
+---------------------------------------------------------------------
+  Modul   : core/evidence.py
+  Apa yang dilakukan:
+    - Setiap temuan disimpan sebagai objek Evidence dengan field:
+        * type         : jenis temuan (ctf_flag, http_object, email, dll)
+        * severity     : tingkat bahaya (CRITICAL/HIGH/MEDIUM/LOW/INFO)
+        * packet_offset: nomor paket di mana temuan ditemukan
+        * timestamp    : waktu paket (epoch seconds)
+        * source_ip    : IP pengirim
+        * dest_ip      : IP penerima
+        * payload_hash : SHA-256 dari isi/artefak temuan
+        * details      : data lengkap spesifik per temuan
+    - Duplikasi otomatis terfilter via payload_hash
+  Kegunaan:
+    - Dokumentasi forensik yang dapat dipertanggungjawabkan
+    - Chain-of-custody: bukti tidak bisa dipalsukan tanpa mengubah hash
+
+---------------------------------------------------------------------
+FUNGSI 3: CTF HELPER (Pencari Flag)
+---------------------------------------------------------------------
+  Analyzer : StringHunterAnalyzer
+  Apa yang dilakukan:
+    - Scan SEMUA payload TCP dan UDP dengan regex:
+        * CTF Flag    : CTF{...}, FLAG{...}, picoCTF{...}, HTB{...},
+                        THM{...}, MBC{...}
+        * JWT Token   : eyJ....eyJ....xxxxx (3 bagian base64)
+        * Base64 Blob : string panjang >20 karakter (dengan filter entropi
+                        agar tidak false positive)
+        * Hex Blob    : string hex >32 karakter
+    - Untuk setiap base64 yang ditemukan, otomatis di-decode dan isinya
+      ditampilkan sebagai preview
+  Kegunaan:
+    - CTF: temukan flag yang disembunyikan di dalam traffic HTTP, DNS, dll
+    - Forensik: temukan data yang diencode/diobfuscate
+    - Red team: identifikasi token otentikasi yang bocor
+
+---------------------------------------------------------------------
+FUNGSI 4: OBJECT EXTRACTION (Ekstraksi File)
+---------------------------------------------------------------------
+  Analyzer : HttpExtractorAnalyzer + TftpExtractorAnalyzer
+  Apa yang dilakukan untuk HTTP:
+    - Merekonstruksi (reassemble) TCP stream
+    - Parse request dan response HTTP
+    - Handle chunked transfer encoding
+    - Decompress gzip dan deflate
+    - Handle multipart form data
+    - Simpan body ke disk dengan nama: {sha256[:16]}.{ekstensi}
+    - Deteksi tipe file dari magic bytes (PNG, JPG, PDF, ZIP, HTML, dll)
+  Apa yang dilakukan untuk TFTP:
+    - Kumpulkan semua paket DATA (opcode 3) per koneksi
+    - Urutkan berdasarkan block number
+    - Gabungkan jadi file utuh
+    - Simpan dengan nama asli dari paket RRQ/WRQ
+  Kegunaan:
+    - Forensik: ekstrak file berbahaya yang dikirim lewat HTTP
+    - Malware analysis: dapatkan payload tanpa buka Wireshark
+    - TFTP: banyak dipakai router/switch untuk firmware update, bisa diawasi
+
+---------------------------------------------------------------------
+FUNGSI 5: ARTIFACT SEARCH (Pencarian Artefak)
+---------------------------------------------------------------------
+  Analyzer : ArtifactSearchAnalyzer
+  Pola yang dicari:
+    * email          : user@domain.com (RFC 5322 simplified)
+    * url            : http:// dan https:// URL
+    * aws_access_key : AKIA[0-9A-Z]{16} (AWS access key)
+    * aws_secret_key : kombinasi kata "secret/sk" + 40-char key
+    * http_basic_auth: header Authorization: Basic ...
+    * cookie         : header Set-Cookie
+    * password_param : ?password=xxx atau ?passwd=xxx di URL/body
+  Kegunaan:
+    - Deteksi credential leak di jaringan
+    - Audit keamanan: apakah aplikasi kirim password via HTTP cleartext?
+    - Deteksi AWS key yang bocor (sangat berbahaya)
+    - Rekam semua URL yang diakses
+
+---------------------------------------------------------------------
+FUNGSI 6: MULTI-FORMAT REPORT (Laporan Multi-Format)
+---------------------------------------------------------------------
+  Reporters: JSON, CSV, HTML, Markdown, Plain Text
+  Detail masing-masing:
+    * JSON   : machine-readable, untuk SIEM, dapat diproses script
+    * CSV    : buka di Excel, satu baris per temuan
+    * HTML   : buka di browser, ada search box, filter severity,
+               klik baris untuk lihat detail lengkap
+    * MD     : Markdown untuk laporan IR (paste ke Jira, GitHub, Notion)
+    * TXT    : plain text untuk terminal, log redirection
+
+  Header di setiap laporan:
+    - Path file PCAP
+    - SHA-256 file (untuk chain-of-custody)
+    - Format (pcap/pcapng)
+    - Jumlah paket dan durasi
+
+
+================================================================================
+3. ARSITEKTUR DAN CARA KERJA INTERNAL
+================================================================================
+
+PCAPTriage menggunakan arsitektur Modular Pipeline dengan pola Plugin-based
+Analyzer + Multi-format Renderer.
+
+---------------------------------------------------------------------
+DIAGRAM ARSITEKTUR
+---------------------------------------------------------------------
+
+  ┌─────────────────────────────────────────────────────┐
+  │                   INPUT LAYER                       │
+  │                                                     │
+  │   sample.pcap  ──▶  PcapLoader  ──▶  Validation    │
+  │                     (scapy)          (magic bytes)  │
+  │                          │                          │
+  │                          ▼                          │
+  │                   SHA-256 File Hash                 │
+  │                   (chain of custody)                │
+  └───────────────────────┬─────────────────────────────┘
+                          │
+                          ▼
+  ┌─────────────────────────────────────────────────────┐
+  │                  ANALYZER PIPELINE                  │
+  │                                                     │
+  │  ┌──────────┐  ┌──────────┐  ┌──────────────────┐  │
+  │  │ Summary  │  │ Talkers  │  │  StringHunter    │  │
+  │  │ Analyzer │  │ Analyzer │  │  Analyzer        │  │
+  │  └────┬─────┘  └────┬─────┘  └────────┬─────────┘  │
+  │       │             │                  │            │
+  │  ┌────┴─────┐  ┌────┴──────┐  ┌───────┴──────────┐ │
+  │  │  HTTP    │  │   TFTP    │  │    Artifact      │ │
+  │  │ Extract  │  │  Extract  │  │    Search        │ │
+  │  └────┬─────┘  └────┬──────┘  └───────┬──────────┘ │
+  │       │             │                  │            │
+  │       └─────────────┴──────────────────┘            │
+  │                          │                          │
+  │            (ThreadPoolExecutor - paralel)           │
+  └───────────────────────┬─────────────────────────────┘
+                          │
+                          ▼
+  ┌─────────────────────────────────────────────────────┐
+  │               EVIDENCE CONSOLIDATION                │
+  │                                                     │
+  │   EvidenceStore:                                    │
+  │     - Kumpulkan semua Evidence dari tiap analyzer  │
+  │     - Deduplication via payload_hash SHA-256        │
+  │     - Sort by severity (CRITICAL dulu), lalu offset │
+  └───────────────────────┬─────────────────────────────┘
+                          │
+                          ▼
+  ┌─────────────────────────────────────────────────────┐
+  │                 REPORT RENDERING                    │
+  │                                                     │
+  │   ┌─────┐  ┌─────┐  ┌─────┐  ┌────┐  ┌────────┐   │
+  │   │JSON │  │ CSV │  │HTML │  │ MD │  │  TXT   │   │
+  │   └─────┘  └─────┘  └─────┘  └────┘  └────────┘   │
+  └───────────────────────┬─────────────────────────────┘
+                          │
+                          ▼
+  ┌─────────────────────────────────────────────────────┐
+  │                    OUTPUT                           │
+  │                                                     │
+  │   output/                                           │
+  │   ├── report.json                                   │
+  │   ├── report.csv                                    │
+  │   ├── report.html  (buka di browser)                │
+  │   ├── report.md                                     │
+  │   ├── report.txt                                    │
+  │   └── objects/                                      │
+  │       ├── http/  (file yang didownload)             │
+  │       └── tftp/  (file yang ditransfer)             │
+  │                                                     │
+  │   STDOUT: rich.Table dengan severity color          │
+  │   EXIT CODE: 0=bersih, 1=ada temuan, 2=error        │
+  └─────────────────────────────────────────────────────┘
+
+---------------------------------------------------------------------
+DETAIL ALUR EKSEKUSI (STEP BY STEP)
+---------------------------------------------------------------------
+
+STEP 1 — VALIDASI INPUT
+  File PCAP dibaca 4 byte pertama (magic bytes):
+    - 0xa1b2c3d4  →  PCAP format (little-endian)
+    - 0xd4c3b2a1  →  PCAP format (big-endian)
+    - 0x0a0d0d0a  →  PCAPNG format
+  Jika magic bytes tidak cocok → error, tool berhenti
+  File path, ukuran, dan SHA-256 dicatat sebagai metadata
+
+STEP 2 — LOADING
+  scapy.rdpcap() memuat semua paket ke memory
+  Untuk file sangat besar, gunakan scapy.PcapReader() (streaming)
+  Progress bar ditampilkan selama loading
+
+STEP 3 — ANALYZER PIPELINE
+  Semua analyzer dijalankan PARALEL via ThreadPoolExecutor (8 thread)
+  Setiap analyzer menerima daftar paket dan mengembalikan List[Evidence]
+  Jika satu analyzer gagal (exception), analyzer lain tetap berjalan
+
+STEP 4 — EVIDENCE CONSOLIDATION
+  Semua Evidence dikumpulkan ke EvidenceStore
+  Duplikat dengan payload_hash yang sama otomatis dibuang
+  Evidence diurutkan: severity tertinggi (CRITICAL) di atas
+
+STEP 5 — REPORT GENERATION
+  Reporter yang sesuai --format dipanggil
+  HTML reporter menggunakan Jinja2 template
+  Semua reporter menerima (EvidenceStore, PcapMetadata, output_dir)
+
+STEP 6 — OUTPUT
+  File ditulis ke output directory
+  Tabel ringkasan dicetak ke terminal dengan warna
+  Program keluar dengan kode: 0, 1, atau 2
+
+---------------------------------------------------------------------
+STACK TEKNOLOGI
+---------------------------------------------------------------------
+
+  Bahasa     : Python 3.10+
+  PCAP parse : scapy 2.5+ (primary), dpkt 1.9+ (tersedia sebagai fallback)
+  CLI        : Click 8.1+
+  Progress   : rich 13.0+ (progress bar, colored tables)
+  HTML report: Jinja2 3.1+ (template engine)
+  Hashing    : hashlib (stdlib, built-in Python)
+  HTTP decom : gzip, zlib (stdlib, built-in Python)
+  Testing    : pytest 7.4+
+
+---------------------------------------------------------------------
+STRUKTUR CLASS UTAMA
+---------------------------------------------------------------------
+
+  AnalyzerBase (abstract)
+    └── run(packets: List[Packet]) → List[Evidence]   ← wajib diimplementasi
+    └── ctx: AnalyzerContext                           ← shared context
+
+  Evidence (dataclass)
+    └── type: str
+    └── severity: Severity (Enum)
+    └── packet_offset: int
+    └── timestamp: float
+    └── source_ip: str
+    └── dest_ip: str
+    └── payload_hash: str  ← SHA-256 hex
+    └── details: dict
+
+  EvidenceStore
+    └── add(evidence)    ← dedup via hash
+    └── all()            ← sorted by severity
+    └── by_severity()    ← count per level
+
+  PcapLoader
+    └── validate()       ← cek magic bytes
+    └── metadata()       ← hash + size + format
+    └── load_all()       ← rdpcap
+    └── stream()         ← PcapReader iterator
+
+
+================================================================================
+4. INSTALASI STEP-BY-STEP
+================================================================================
+
+PERSYARATAN SISTEM:
+  - Python 3.10 atau lebih baru
+  - pip (package manager Python)
+  - 100MB disk space (untuk dependencies)
+  - Windows 10/11, macOS 12+, atau Linux Ubuntu 20.04+
+
+LANGKAH INSTALASI:
+
+Langkah 1 — Clone atau download project
+  Jika dari GitHub:
+    git clone https://github.com/mbc-telkom/pcaptriage.git
+    cd pcaptriage
+
+  Jika sudah ada di folder lokal:
+    cd "D:\Portofolio Cyber Alif\Project 3 pcap assist for triage\pcaptriage"
+
+Langkah 2 — Buat virtual environment (SANGAT DIANJURKAN)
+  Windows:
+    python -m venv .venv
+    .venv\Scripts\activate
+
+  macOS / Linux:
+    python3 -m venv .venv
+    source .venv/bin/activate
+
+  Tanda berhasil: ada (.venv) di awal prompt terminal
+
+Langkah 3 — Install pcaptriage
+  pip install -e .
+
+  Flag -e artinya "editable mode" = kode langsung terhubung, tidak perlu
+  reinstall setiap kali ubah kode
+
+Langkah 4 — Verifikasi instalasi
+  pcaptriage --version
+  Output yang diharapkan: pcaptriage, version 0.1.0
+
+  Jika muncul "command not found":
+    Windows: coba  python -m pcaptriage.cli --version
+    Atau tambahkan Scripts folder Python ke PATH
+
+Langkah 5 — Install dev tools (opsional, untuk testing)
+  pip install -e ".[dev]"
+
+
+================================================================================
+5. STRUKTUR FOLDER
+================================================================================
+
+pcaptriage/                          ← root project
+│
+├── pcaptriage/                      ← package Python utama
+│   ├── __init__.py                  ← versi tool (0.1.0)
+│   ├── cli.py                       ← entry point CLI (Click)
+│   │
+│   ├── core/                        ← komponen inti
+│   │   ├── loader.py                ← baca & validasi file PCAP
+│   │   ├── evidence.py              ← dataclass Evidence + EvidenceStore
+│   │   └── hashing.py               ← fungsi SHA-256
+│   │
+│   ├── analyzers/                   ← plugin analyzer
+│   │   ├── base.py                  ← abstract class AnalyzerBase
+│   │   ├── summary.py               ← statistik capture
+│   │   ├── talkers.py               ← top IP & port
+│   │   ├── string_hunter.py         ← CTF flag, JWT, base64, hex
+│   │   ├── artifact_search.py       ← email, URL, credential, AWS key
+│   │   ├── http_extractor.py        ← ekstrak objek HTTP
+│   │   └── tftp_extractor.py        ← rekonstruksi file TFTP
+│   │
+│   ├── reporters/                   ← output renderer
+│   │   ├── json_reporter.py         ← output JSON
+│   │   ├── csv_reporter.py          ← output CSV
+│   │   ├── html_reporter.py         ← output HTML interaktif
+│   │   ├── markdown_reporter.py     ← output Markdown
+│   │   └── text_reporter.py         ← output plain text
+│   │
+│   └── templates/
+│       └── report.html.j2           ← template HTML (Jinja2)
+│
+├── tests/
+│   ├── conftest.py                  ← auto-generate sample.pcap
+│   ├── test_smoke.py                ← 3 smoke tests
+│   └── fixtures/
+│       └── sample.pcap              ← auto-generated saat test berjalan
+│
+├── examples/
+│   └── README.md                    ← petunjuk contoh
+│
+├── pyproject.toml                   ← konfigurasi project & dependencies
+├── README.md                        ← dokumentasi singkat
+├── .gitignore                       ← file yang tidak di-commit (*.pcap dll)
+└── PANDUAN_PENGGUNAAN.txt           ← file ini
+
+
+================================================================================
+6. PANDUAN PERINTAH (COMMAND REFERENCE)
+================================================================================
+
+=====================================================================
+PERINTAH 1: analyze — Analisis Lengkap
+=====================================================================
+
+SINTAKS:
+  pcaptriage analyze <file.pcap> --output <folder> --format <format>
+
+PARAMETER:
+  <file.pcap>           : path ke file PCAP atau PCAPNG (WAJIB)
+  --output, -o          : folder tempat menyimpan laporan (WAJIB)
+  --format, -f          : format laporan (default: all)
+                          pilihan: json | csv | html | md | txt | all
+
+CONTOH PENGGUNAAN:
+
+  # Analisis lengkap, semua format laporan
+  pcaptriage analyze capture.pcap --output ./hasil --format all
+
+  # Hanya output JSON (untuk SIEM / scripting)
+  pcaptriage analyze capture.pcap --output ./hasil --format json
+
+  # Output HTML saja (untuk presentasi)
+  pcaptriage analyze capture.pcap --output ./hasil --format html
+
+  # Output Markdown untuk laporan IR
+  pcaptriage analyze capture.pcap --output ./hasil --format md
+
+  # Dengan path absolut (Windows)
+  pcaptriage analyze "C:\pcap\incident.pcapng" --output "C:\laporan\case01" --format all
+
+  # Dengan path absolut (Linux/Mac)
+  pcaptriage analyze /evidence/traffic.pcap --output /reports/case01 --format all
+
+HASIL OUTPUT:
+  hasil/
+  ├── report.json         ← machine-readable
+  ├── report.csv          ← Excel-compatible
+  ├── report.html         ← buka di browser
+  ├── report.md           ← Markdown
+  ├── report.txt          ← plain text
+  └── objects/
+      ├── http/           ← file yang diekstrak dari HTTP
+      └── tftp/           ← file yang diekstrak dari TFTP
+
+EXIT CODE:
+  0 = tidak ada temuan (capture bersih)
+  1 = ada temuan (CRITICAL/HIGH/MEDIUM/LOW ditemukan)
+  2 = error (file tidak valid, permission error, dll)
+
+=====================================================================
+PERINTAH 2: extract — Ekstraksi File Saja
+=====================================================================
+
+SINTAKS:
+  pcaptriage extract <file.pcap> --type <jenis> --output <folder>
+
+PARAMETER:
+  <file.pcap>         : path ke file PCAP/PCAPNG (WAJIB)
+  --type, -t          : jenis transfer yang diekstrak (default: all)
+                        pilihan: http | tftp | all
+  --output, -o        : folder output (WAJIB)
+
+CONTOH PENGGUNAAN:
+
+  # Ekstrak semua objek HTTP dan TFTP
+  pcaptriage extract traffic.pcap --type all --output ./objects
+
+  # Hanya objek HTTP (gambar, HTML, JSON, dll yang didownload)
+  pcaptriage extract traffic.pcap --type http --output ./http_objects
+
+  # Hanya file TFTP (firmware, config router, dll)
+  pcaptriage extract traffic.pcap --type tftp --output ./tftp_objects
+
+HASIL OUTPUT:
+  objects/
+  ├── report.json              ← ringkasan objek yang ditemukan
+  └── objects/
+      ├── http/
+      │   ├── a3f7c2b1d8e4...  .html
+      │   ├── 9b2e6f0a4c1d...  .jpg
+      │   └── 7e5d3a8b2f1c...  .bin
+      └── tftp/
+          ├── 4a1b7c9d2e8f...  _config.bin
+          └── 2c5f8a1b3d7e...  _firmware.img
+
+CATATAN:
+  - Nama file = 16 karakter pertama SHA-256 + ekstensi otomatis
+  - Tipe file dideteksi dari magic bytes, bukan ekstensi di header HTTP
+  - File yang sama (hash sama) hanya disimpan sekali (dedup)
+
+=====================================================================
+PERINTAH 3: hunt — Berburu Flag & Credential
+=====================================================================
+
+SINTAKS:
+  pcaptriage hunt <file.pcap> --pattern <pola> --output <folder>
+
+PARAMETER:
+  <file.pcap>         : path ke file PCAP/PCAPNG (WAJIB)
+  --pattern, -p       : pola yang dicari (default: all)
+                        pilihan: ctf | creds | all
+  --output, -o        : folder output (default: ./pcap_hunt_out)
+
+CONTOH PENGGUNAAN:
+
+  # Cari semua: flag CTF + credential
+  pcaptriage hunt challenge.pcap --pattern all
+
+  # Hanya cari flag CTF
+  pcaptriage hunt challenge.pcap --pattern ctf --output ./ctf_hunt
+
+  # Hanya cari credential bocor
+  pcaptriage hunt network.pcap --pattern creds --output ./cred_hunt
+
+POLA YANG DICARI:
+  ctf   → CTF{...}, FLAG{...}, picoCTF{...}, HTB{...}, THM{...}, MBC{...}
+           JWT token, base64 blob (dengan filter entropi), hex string
+  creds → email, URL, HTTP Basic Auth, cookie, password parameter, AWS key
+
+
+================================================================================
+7. CONTOH SKENARIO PENGGUNAAN
+================================================================================
+
+---------------------------------------------------------------------
+SKENARIO A: CTF Competition — "Ada flag di file pcap ini"
+---------------------------------------------------------------------
+
+  1. Download file .pcap dari soal CTF
+  2. Jalankan:
+       pcaptriage hunt chall.pcap --pattern ctf --output ./hunt
+  3. Buka hunt/report.txt, lihat bagian "ctf_flag"
+  4. Flag yang ditemukan ada di details.flag
+  5. Jika tidak ketemu, coba:
+       pcaptriage hunt chall.pcap --pattern all --output ./hunt
+     (kadang flag ada di dalam JWT atau base64 yang nested)
+
+---------------------------------------------------------------------
+SKENARIO B: Incident Response — "Ada malware download file lewat HTTP"
+---------------------------------------------------------------------
+
+  1. Dapatkan capture dari sensor IDS/firewall
+  2. Jalankan analisis penuh:
+       pcaptriage analyze incident.pcap --output ./ir_case01 --format all
+  3. Buka ir_case01/report.html di browser
+  4. Filter "Severity = HIGH" untuk lihat temuan penting
+  5. Buka ir_case01/objects/http/ untuk lihat file yang didownload
+  6. Gunakan ir_case01/report.json untuk upload ke SIEM atau MISP
+  7. Gunakan ir_case01/report.md untuk paste ke tiket Jira/JIRA IR
+
+---------------------------------------------------------------------
+SKENARIO C: Audit Keamanan — "Apakah ada credential plaintext?"
+---------------------------------------------------------------------
+
+  1. Capture traffic internal beberapa menit
+  2. Jalankan:
+       pcaptriage hunt internal.pcap --pattern creds --output ./audit
+  3. Cek audit/report.txt untuk:
+       - http_basic_auth    → ada aplikasi pakai HTTP Basic tanpa HTTPS?
+       - password_param     → ada ?password=xxx di URL?
+       - aws_access_key     → ada AWS key yang bocor di traffic?
+       - email              → ada email yang dikirim cleartext?
+  4. Buat laporan dari audit/report.md
+
+---------------------------------------------------------------------
+SKENARIO D: Forensik TFTP — "Router kirim config ke mana?"
+---------------------------------------------------------------------
+
+  1. Capture traffic jaringan yang ada device TFTP
+  2. Jalankan:
+       pcaptriage extract traffic.pcap --type tftp --output ./tftp_evidence
+  3. Buka tftp_evidence/objects/tftp/
+  4. File config/firmware akan ada di sana dengan nama aslinya
+  5. Analisis isi file config untuk temukan password default, dsb.
+
+---------------------------------------------------------------------
+SKENARIO E: Training Lab — Jalankan dengan Sample PCAP Built-in
+---------------------------------------------------------------------
+
+  1. Pastikan sudah install pytest:
+       pip install -e ".[dev]"
+  2. Generate sample PCAP:
+       python -m pytest tests/ -q
+     (ini otomatis generate tests/fixtures/sample.pcap)
+  3. Jalankan analisis terhadap sample:
+       pcaptriage analyze tests/fixtures/sample.pcap --output ./demo --format all
+  4. Buka ./demo/report.html di browser
+  5. Lihat: ada 1 temuan CRITICAL = CTF{test_flag_12345} yang sudah ditanam
+     di dalam HTTP response paket ke-14
+
+
+================================================================================
+8. FORMAT OUTPUT & LAPORAN
+================================================================================
+
+---------------------------------------------------------------------
+report.json (untuk SIEM / scripting)
+---------------------------------------------------------------------
+Struktur:
+{
+  "schema": "pcaptriage/v1",
+  "capture": {
+    "path": "...",
+    "sha256": "...",          ← hash file PCAP untuk chain-of-custody
+    "packet_count": 60,
+    "duration_seconds": 0.03
+  },
+  "severity_counts": {
+    "CRITICAL": 1,
+    "HIGH": 0, ...
+  },
+  "findings": [
+    {
+      "type": "ctf_flag",
+      "severity": "CRITICAL",
+      "packet_offset": 14,    ← nomor paket
+      "timestamp": 1234567890.123,
+      "source_ip": "10.0.0.5",
+      "dest_ip": "93.184.216.34",
+      "payload_hash": "abc123...",
+      "details": {
+        "flag": "CTF{test_flag_12345}"
+      }
+    }
+  ]
+}
+
+---------------------------------------------------------------------
+report.csv (untuk Excel)
+---------------------------------------------------------------------
+Buka di Microsoft Excel atau LibreOffice Calc.
+Kolom: type, severity, packet_offset, timestamp, source_ip, dest_ip,
+       payload_hash, details_json
+
+---------------------------------------------------------------------
+report.html (untuk presentasi & review)
+---------------------------------------------------------------------
+Buka di Chrome, Firefox, atau Edge.
+Fitur interaktif:
+  - Search box di atas: ketik kata kunci untuk filter temuan
+  - Dropdown severity: filter hanya CRITICAL atau HIGH
+  - Klik baris: expand untuk lihat detail JSON lengkap
+  - Summary cards di atas: total packet, duration, findings per severity
+
+---------------------------------------------------------------------
+report.md (untuk IR ticket)
+---------------------------------------------------------------------
+Copy-paste ke Jira, Confluence, GitHub Issues, Notion, atau Obsidian.
+Format heading: ## Finding: ctf_flag — CRITICAL
+
+---------------------------------------------------------------------
+report.txt (untuk log & terminal)
+---------------------------------------------------------------------
+Simpan ke log server: pcaptriage analyze ... > hasil.txt 2>&1
+Grep temuan: grep "CRITICAL" hasil.txt
+
+
+================================================================================
+9. MEMAHAMI EVIDENCE & SEVERITY
+================================================================================
+
+LEVEL SEVERITY DAN ARTINYA:
+
+  CRITICAL  ← Butuh tindakan SEGERA
+    Contoh: CTF flag ditemukan, AWS secret key bocor, password telanjang
+    Warna di HTML: MERAH
+
+  HIGH      ← Perlu investigasi dalam waktu dekat
+    Contoh: JWT token, AWS access key, HTTP Basic Auth credential,
+            password parameter di URL, base64 yang berisi data sensitif
+    Warna di HTML: ORANYE
+
+  MEDIUM    ← Perlu dicatat, investigasi sesuai prioritas
+    Contoh: File yang diekstrak dari HTTP, cookie yang ditemukan,
+            file yang ditransfer via TFTP
+    Warna di HTML: KUNING
+
+  LOW       ← Informasi tambahan, mungkin tidak berbahaya
+    Contoh: String base64 umum, hex string, URL biasa
+    Warna di HTML: BIRU MUDA
+
+  INFO      ← Informasi statistik, bukan ancaman
+    Contoh: Ringkasan capture, top talker, statistik protokol
+    Warna di HTML: ABU-ABU
+
+FIELD PENTING DI SETIAP EVIDENCE:
+
+  packet_offset = nomor urut paket di PCAP (mulai dari 0)
+    → Gunakan ini untuk buka di Wireshark: Edit > Go to Packet > <nomor>
+
+  payload_hash  = SHA-256 dari konten artefak yang ditemukan
+    → Bukan hash file PCAP, ini hash dari isi evidence spesifik
+    → Gunakan untuk verifikasi integritas atau cek di VirusTotal (jika file)
+
+  timestamp     = waktu paket dalam epoch seconds
+    → Konversi: python -c "import datetime; print(datetime.datetime.fromtimestamp(1234567890))"
+
+  source_ip / dest_ip
+    → IP dari paket di mana evidence ditemukan
+    → Untuk HTTP: source bisa client atau server tergantung direction
+
+
+================================================================================
+10. TIPS UNTUK CTF
+================================================================================
+
+TIP 1 — Coba semua pola dulu
+  pcaptriage hunt soal.pcap --pattern all
+
+TIP 2 — Perhatikan base64_blob
+  Banyak soal CTF encode flag dalam base64, lalu taruh di HTTP header atau body
+  Lihat details.decoded_preview di temuan base64_blob
+
+TIP 3 — Buka file yang diekstrak
+  pcaptriage extract soal.pcap --type http --output ./obj
+  Buka folder ./obj/objects/http/ dan lihat isinya
+  Flag sering disembunyikan di dalam file gambar, PDF, atau zip
+
+TIP 4 — Cek JWT
+  Banyak soal CTF pakai JWT sebagai pembawa flag tersembunyi
+  pcaptriage hunt soal.pcap --pattern ctf
+  Lihat temuan jwt_token, copy token, decode di jwt.io
+
+TIP 5 — Cek encoding nested
+  Flag bisa dibase64 berkali-kali: FLAG → base64 → taruh di HTTP body
+  StringHunter otomatis decode sekali, tapi untuk nested perlu manual
+
+TIP 6 — Gunakan grep di report.txt
+  grep "CTF{" hunt_out/report.txt
+  grep "picoCTF" hunt_out/report.txt
+
+
+================================================================================
+11. TIPS UNTUK SOC / INCIDENT RESPONSE
+================================================================================
+
+TIP 1 — Selalu catat SHA-256 file PCAP
+  pcaptriage mencetak SHA-256 file di awal dan di semua laporan.
+  Catat ini sebelum analisis dimulai — ini bukti file tidak dimanipulasi.
+
+TIP 2 — Gunakan JSON untuk integrasi SIEM
+  Upload report.json ke Splunk, Elastic, atau MISP:
+    curl -X POST https://siem.company.com/api/events \
+      -H "Content-Type: application/json" \
+      -d @report.json
+
+TIP 3 — Ikuti packet_offset ke Wireshark
+  Jika temuan mencurigakan di packet_offset 42:
+    Buka di Wireshark: tekan Ctrl+G, masukkan 43 (Wireshark mulai dari 1)
+
+TIP 4 — Otomatisasi dengan exit code
+  Script bash untuk alert jika ada temuan:
+    pcaptriage analyze capture.pcap -o /tmp/r -f json
+    if [ $? -eq 1 ]; then
+      echo "ALERT: Findings detected!" | mail -s "PCAPTriage Alert" soc@company.com
+    fi
+
+TIP 5 — Proses banyak file sekaligus
+  for f in *.pcap; do
+    pcaptriage analyze "$f" --output "./results/${f%.pcap}" --format json
+  done
+
+
+================================================================================
+12. TROUBLESHOOTING
+================================================================================
+
+MASALAH: "command not found: pcaptriage"
+  SOLUSI:
+    1. Pastikan virtual env aktif (.venv)
+    2. Coba: python -m pcaptriage.cli --version
+    3. Windows: tambah folder Scripts ke PATH, atau pakai path penuh:
+       C:\Users\<user>\.venv\Scripts\pcaptriage.exe
+
+MASALAH: "scapy ImportError" atau "No module named scapy"
+  SOLUSI:
+    pip install scapy>=2.5
+    Jika di Windows, mungkin perlu install npcap juga dari: npcap.com
+
+MASALAH: "Unrecognized capture magic bytes"
+  SOLUSI:
+    File bukan PCAP/PCAPNG yang valid.
+    Cek file dengan: python -c "print(open('file.pcap','rb').read(4).hex())"
+    PCAP valid dimulai dengan: a1b2c3d4 atau d4c3b2a1
+
+MASALAH: "PermissionError" saat tulis output
+  SOLUSI:
+    Pastikan folder output bisa ditulis:
+    Windows: jalankan terminal sebagai Administrator, atau pilih folder lain
+    Linux: chmod 755 ./output atau pilih folder di home directory
+
+MASALAH: Laporan HTML tidak menampilkan tabel (kosong)
+  SOLUSI:
+    Buka di browser modern (Chrome/Firefox/Edge)
+    Jangan buka lewat path file:// jika ada CSP
+    Coba: python -m http.server 8080 di folder output, buka localhost:8080
+
+MASALAH: Tool berjalan sangat lambat di file PCAP besar (>500MB)
+  SOLUSI:
+    Ini normal karena rdpcap() load semua ke memory.
+    Untuk file besar, gunakan tcpdump untuk potong dulu:
+    tcpdump -r big.pcap -w small.pcap "tcp port 80" -C 50 -W 5
+
+MASALAH: False positive banyak di base64_blob
+  SOLUSI:
+    Ini by design — filter entropi sudah dipasang (>4.0 bits/byte)
+    Fokus ke temuan CRITICAL dan HIGH, abaikan LOW/INFO jika tidak relevan
+
+
+================================================================================
+13. CARA MENJALANKAN UNIT TEST
+================================================================================
+
+INSTALL DEPENDENCIES TEST:
+  pip install -e ".[dev]"
+
+JALANKAN SEMUA TEST:
+  pytest
+
+JALANKAN DENGAN DETAIL VERBOSE:
+  pytest -v
+
+JALANKAN TEST TERTENTU SAJA:
+  pytest tests/test_smoke.py::test_string_hunter_finds_flag -v
+
+CEK COVERAGE:
+  pytest --cov=pcaptriage --cov-report=term-missing
+
+DESKRIPSI 3 TEST YANG ADA:
+
+  test_loader_metadata
+    → Memuat sample.pcap, cek format = "pcap" dan SHA-256 valid (64 karakter)
+
+  test_string_hunter_finds_flag
+    → Jalankan StringHunterAnalyzer, pastikan temukan CTF{test_flag_12345}
+      yang ditanam di paket HTTP response nomor 7
+
+  test_full_pipeline_writes_reports
+    → Jalankan semua analyzer, lalu semua reporter
+    → Pastikan 5 file laporan ada dan tidak kosong
+
+
+================================================================================
+         PCAPTriage v0.1.0 — MBC Telkom University Network Security Lab
+         Dibuat untuk: SOC Analyst, CTF Player, Network Forensics Researcher
+         Lisensi: MIT
+================================================================================
